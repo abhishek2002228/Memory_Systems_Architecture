@@ -1,0 +1,140 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{booktabs,hyperref,amsmath}
+% 4-core results (from scripts/analyze.py)
+\newcommand{\MixOneShip}{0.9997}\newcommand{\MixOneApu}{1.0518}
+\newcommand{\MixTwoShip}{0.9947}\newcommand{\MixTwoApu}{1.0075}
+\newcommand{\GmShip}{0.9972}\newcommand{\GmApu}{1.0294}
+\newcommand{\FourCoreNote}{APU gains most on mix~1, where it
+shields the two mcf cores from the libquantum streams (mcf shared IPC 0.127 vs.\ 0.097 under
+LRU), and is close to LRU on mix~2.
+Because each policy is normalised by its \emph{own} single-core IPC, a policy that already
+speeds up mcf when run alone gets little extra credit in the weighted speedup; this is why
+SHIP++ scores $\approx$1.0 despite clearly beating LRU in absolute IPC.}
+\title{SHIP++ with Adaptive Prefetch Utility (APU)\\\large LLC Replacement for the CRC2 ChampSim Framework}
+\author{Memory System Architecture --- Lab 2}
+\date{}
+\begin{document}
+\maketitle
+
+\section{Overview}
+The assignment had two parts: (A) implement SHIP++ as an LLC replacement policy in
+ChampSim, and (B) design a policy that beats it. Part A is
+\texttt{replacement/ship\_pp.llc\_repl}; Part B, described here, is
+\texttt{replacement/custom.llc\_repl}. It keeps SHIP++'s demand-side behaviour and adds
+three mechanisms aimed at prefetch pollution and writeback traffic.
+
+\section{Baseline: SHIP++}
+SHIP++ combines SRRIP with a Signature History Counter Table (SHCT). Each line carries a
+2-bit re-reference prediction value (RRPV, 0--3; higher means reuse is less likely).
+SHCT entries are 3-bit saturating counters indexed by a PC-based signature and trained on
+a small set of sampled sets. On a demand fill, a signature with SHCT~$=0$ is predicted dead
+and inserted at RRPV~3, SHCT~$=7$ is inserted at RRPV~0, and everything else at RRPV~2.
+
+\section{Design}
+\subsection{Adaptive Prefetch Utility}
+Guiding principle: \emph{prefetches are guilty until proven innocent}. Rather than treat
+prefetch fills like demand fills, the policy measures how useful prefetches actually are:
+\begin{itemize}
+  \item a prefetched line is \textbf{useful} if it receives a demand hit before eviction;
+  \item global counters track \texttt{apu\_pf\_fills} and \texttt{apu\_pf\_useful};
+  \item utility $= \texttt{apu\_pf\_useful} / \texttt{apu\_pf\_fills}$.
+\end{itemize}
+Prefetch insertion is then set by the observed utility:
+\begin{center}
+\begin{tabular}{ll}
+  \toprule
+  Prefetch utility & Insertion \\
+  \midrule
+  $<10\%$     & always RRPV~3 \\
+  $10$--$30\%$ & RRPV~2 only if SHCT~$\ge 6$, otherwise RRPV~3 \\
+  $\ge 30\%$  & RRPV~2 only if SHCT~$\ge 5$, otherwise RRPV~3 \\
+  \bottomrule
+\end{tabular}
+\end{center}
+Demand fills keep the SHIP++ rule unchanged.
+
+\subsection{Region-Augmented Prefetch Signatures}
+SHIP++ signatures are PC-based, so unrelated prefetch streams issued from the same PC
+alias in the SHCT. For \emph{prefetch fills only}, the signature is hashed with a coarse
+physical region tag (4\,KB regions, truncated to 6 bits). This separates streams and
+sharpens SHCT predictions without growing the table.
+
+\subsection{Clean-First Victim Selection}
+Among the candidates at RRPV~3, clean lines are evicted before dirty ones. This cuts
+writeback traffic and frees DRAM bandwidth without changing the prediction logic.
+
+\section{Storage Overhead}
+For a single core ($S = 2048$ sets, $W = 16$ ways):
+\begin{center}
+\begin{tabular}{lrr}
+  \toprule
+  Structure & Formula & Bits \\
+  \midrule
+  Per-line RRPV, is-prefetch, got-demand-hit & $4 \times S W$ & 131{,}072 \\
+  SHCT (3-bit, 16K entries)                 & $3 \times 16384 \times C$ & 49{,}152 \\
+  Sampled-set signature + reuse bit (64 sets) & $15 \times 64 W$ & 15{,}360 \\
+  Sampled-set index map                      & $\approx 7 \times S$ & 14{,}336 \\
+  APU counters                               & $4 \times 64$ & 256 \\
+  \midrule
+  \textbf{Total} & & \textbf{210{,}176 ($\approx$25.7\,KB)} \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+\section{Evaluation}
+All runs use 10M warmup and 10M simulated instructions on the CRC2 traces
+(bzip2, libquantum, mcf, xalancbmk). Speedups are relative to LRU. Runs are produced by \texttt{scripts/run\_eval.sh} and
+summarised by \texttt{scripts/analyze.py}.
+
+\subsection{Single Core}
+\begin{center}
+\begin{tabular}{lcccc}
+  \toprule
+  & \multicolumn{2}{c}{No prefetch} & \multicolumn{2}{c}{next\_line + ip\_stride} \\
+  \cmidrule(lr){2-3}\cmidrule(lr){4-5}
+  Trace & SHIP++ & APU & SHIP++ & APU \\
+  \midrule
+  bzip2      & 0.9996 & 0.9835 & 1.0166 & 1.0557 \\
+  libquantum & 1.0117 & 1.0551 & 1.0070 & 1.0458 \\
+  mcf        & 1.2015 & 1.1815 & 1.2016 & 1.1995 \\
+  xalancbmk  & 0.9990 & 0.9991 & 0.9985 & 0.9952 \\
+  \midrule
+  \textbf{Geomean} & 1.0496 & \textbf{1.0520} & 1.0527 & \textbf{1.0715} \\
+  \bottomrule
+\end{tabular}
+\end{center}
+APU's gain over SHIP++ comes mainly from prefetch-heavy traces: on bzip2 and libquantum
+with prefetching it adds roughly 4 points of speedup, consistent with APU suppressing
+low-utility prefetches. Without prefetching the mechanisms are mostly idle and the two
+policies are close.
+
+\subsection{Four Cores}
+Metric: weighted speedup
+$\mathrm{WS} = \sum_i \mathrm{IPC}^{\text{shared}}_i / \mathrm{IPC}^{\text{alone}}_i$,
+using each policy's own single-core IPC as $\mathrm{IPC}^{\text{alone}}$, normalised to
+LRU. Prefetchers enabled.
+\begin{center}
+\begin{tabular}{lcc}
+  \toprule
+  Mix & SHIP++ & APU \\
+  \midrule
+  1: mcf, mcf, libquantum, libquantum & \MixOneShip & \MixOneApu \\
+  2: mcf, libquantum, mcf, xalancbmk  & \MixTwoShip & \MixTwoApu \\
+  \midrule
+  \textbf{Geomean} & \GmShip & \textbf{\GmApu} \\
+  \bottomrule
+\end{tabular}
+\end{center}
+\FourCoreNote
+
+\section{Conclusion}
+Treating prefetches as untrusted until they prove useful, giving prefetch streams their
+own region-aware signatures, and preferring clean victims improves on SHIP++ in the
+single-core configuration with prefetching (1.0715$\times$ over LRU versus 1.0527$\times$
+for SHIP++) at a cost of about 26\,KB of state per core. On four cores it also beats both LRU and
+SHIP++ in weighted speedup (1.0294$\times$ versus
+0.9972$\times$ for SHIP++), with the largest gain when memory-bound mcf shares the LLC with
+streaming libquantum.
+
+\end{document}
